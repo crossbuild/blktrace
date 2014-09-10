@@ -73,6 +73,7 @@ enum {
 
 enum thread_status {
 	Th_running,
+	Th_offline,
 	Th_leaving,
 	Th_error
 };
@@ -275,6 +276,8 @@ int data_is_native = -1;
 
 static int ndevs;
 static int ncpus;
+static cpu_set_t * cpu_online_mask;
+static size_t cpu_online_mask_size;
 static int pagesize;
 static int act_mask = ~0U;
 static int kill_running_trace;
@@ -309,6 +312,7 @@ static volatile int dp_entries;
 static pthread_cond_t mt_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t mt_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile int nthreads_running;
+static volatile int nthreads_offline;
 static volatile int nthreads_leaving;
 static volatile int nthreads_error;
 static volatile int tracers_run;
@@ -567,6 +571,8 @@ static void tracer_signal_ready(struct tracer *tp,
 
 	if (th_status == Th_running)
 		nthreads_running++;
+	else if (th_status == Th_offline)
+		nthreads_offline++;
 	else if (th_status == Th_error)
 		nthreads_error++;
 	else
@@ -579,7 +585,7 @@ static void tracer_signal_ready(struct tracer *tp,
 static void wait_tracers_ready(int ncpus_started)
 {
 	pthread_mutex_lock(&mt_mutex);
-	while ((nthreads_running + nthreads_error) < ncpus_started)
+	while ((nthreads_running + nthreads_offline + nthreads_error) < ncpus_started)
 		t_pthread_cond_wait(&mt_cond, &mt_mutex);
 	pthread_mutex_unlock(&mt_mutex);
 }
@@ -1806,10 +1812,20 @@ static int handle_pfds_entries(struct tracer *tp, int nevs, int force_read)
 	return nentries;
 }
 
+static int cpu_online(int cpu) {
+	return CPU_ISSET_S(cpu, cpu_online_mask_size, cpu_online_mask);
+}
+
 static void *thread_main(void *arg)
 {
 	int ret, ndone, to_val;
 	struct tracer *tp = arg;
+
+	if (! cpu_online(tp->cpu)) {
+		fprintf(stderr, "skip offline CPU %d\n", tp->cpu);
+		tracer_signal_ready(tp, Th_offline, 0);
+		return NULL;
+	}
 
 	ret = lock_on_cpu(tp->cpu);
 	if (ret)
@@ -2637,7 +2653,7 @@ static int run_tracers(void)
 	}
 
 	start_tracers();
-	if (nthreads_running == ncpus) {
+	if (nthreads_running + nthreads_offline == ncpus) {
 		unblock_tracers();
 		start_buts();
 		if (net_mode == Net_client)
@@ -2648,11 +2664,47 @@ static int run_tracers(void)
 		stop_tracers();
 
 	wait_tracers();
-	if (nthreads_running == ncpus)
+	if (nthreads_running + nthreads_offline == ncpus)
 		show_stats(&devpaths);
 	if (net_client_use_send())
 		close_client_connections();
 	del_tracers();
+
+	return 0;
+}
+
+static int read_online_cpus() {
+	cpu_online_mask = CPU_ALLOC(ncpus);
+	cpu_online_mask_size = CPU_ALLOC_SIZE(ncpus);
+
+	CPU_ZERO_S(cpu_online_mask_size, cpu_online_mask);
+
+	if (ncpus > 1) {
+		FILE *fp;
+		char line[4096];
+
+		fp = my_fopen("/proc/stat", "r");
+		if (fp == NULL) {
+			CPU_FREE(cpu_online_mask);
+			fprintf(stderr, "opening /proc/stat failed %d/%s\n",
+				errno, strerror(errno));
+			return 1;
+		}
+
+		while (fgets(line, 4096, fp)) {
+			if ((! memcmp(line, "cpu", 3)) && line[3] != ' ') {
+				int cpu;
+				if (sscanf(line + 3, "%d ", &cpu) == 1)
+					CPU_SET_S(cpu, cpu_online_mask_size, cpu_online_mask);
+				else {
+					CPU_FREE(cpu_online_mask);
+					fprintf(stderr, "parsing /proc/stat failed\n");
+					return 1;
+				}
+			}
+		}
+	} else
+		CPU_SET_S(0, cpu_online_mask_size, cpu_online_mask);
 
 	return 0;
 }
@@ -2670,6 +2722,10 @@ int main(int argc, char *argv[])
 		ret = 1;
 		goto out;
 	} else if (handle_args(argc, argv)) {
+		ret = 1;
+		goto out;
+	}
+	if (read_online_cpus()) {
 		ret = 1;
 		goto out;
 	}
@@ -2706,6 +2762,8 @@ int main(int argc, char *argv[])
 		ret = net_server();
 	} else
 		ret = run_tracers();
+
+	CPU_FREE(cpu_online_mask);
 
 out:
 	if (pfp)
